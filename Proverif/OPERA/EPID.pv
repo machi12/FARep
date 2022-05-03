@@ -1,0 +1,201 @@
+(* EPID scheme *)
+type epidikey.
+type epidvkey.
+fun epidvk(epidikey): epidvkey.
+type epidmkey.
+type epidpkow.
+type epidcert.
+fun epidpk(epidmkey, bitstring): epidpkow.
+fun epidct(epidpkow, epidikey, bitstring): epidcert.
+fun epidsign(bitstring, epidmkey, epidcert): bitstring.
+reduc forall m: bitstring, k: epidmkey, c: epidcert; 
+getepidmsg(epidsign(m, k, c)) = m.
+reduc forall m: bitstring, mk: epidmkey, ik: epidikey, nonce: bitstring; 
+checkepidsign(epidsign(m, mk, epidct(epidpk(mk, nonce), ik, nonce)),epidvk(ik)) = m.
+fun vk2bs(epidvkey): bitstring.
+reduc forall vk: epidvkey; bs2vk(vk2bs(vk)) = vk.
+fun pk2bs(epidpkow): bitstring.
+reduc forall pk: epidpkow; bs2pk(pk2bs(pk)) = pk.
+fun ct2bs(epidcert): bitstring.
+reduc forall ct: epidcert; bs2ct(ct2bs(ct)) = ct.
+
+(* Symmetric encryption *)
+type sekey.
+fun senc(bitstring, sekey): bitstring.
+reduc forall m: bitstring, k: sekey;
+sdec(senc(m, k), k) = m.
+
+(* Diffie-Hellman *)
+type G.
+type exponent.
+const g: G [data].
+fun exp(G, exponent): G.
+equation forall x: exponent, y: exponent;
+exp(exp(g, x), y) = exp(exp(g, y), x).
+fun G2sek(G): sekey.
+fun G2bs(G): bitstring.
+reduc forall gxy: G; bs2G(G2bs(gxy)) = gxy.
+
+(* SGXrelated *)
+type sgxsp.
+type mrenc.
+type rpkey.
+fun mr(sgxsp): mrenc.
+fun egetrpkey(sgxsp): rpkey.
+fun ereport(sgxsp, mrenc, bitstring): bitstring.
+reduc forall sFrom: sgxsp, rTo: mrenc, m: bitstring;
+egetreport(ereport(sFrom, rTo, m)) = m.
+reduc forall sFrom: sgxsp, rTo: mrenc, m: bitstring;
+egetmrfrom(ereport(sFrom, rTo, m)) = mr(sFrom).
+reduc forall sFrom: sgxsp, sTo: sgxsp, m: bitstring;
+everif(ereport(sFrom, mr(sTo), m), egetrpkey(sTo)) = m.
+
+(* free names *)
+free ae_ie: channel.
+free ie_qe: channel.
+free ae_qe: channel.
+free la: channel.
+free ra: channel.
+free c: channel.
+free epidikIntel: epidikey [private].
+free sgxIntelQE: sgxsp [private].
+free sgxIssueE: sgxsp [private].
+free sgxAttestE: sgxsp [private].
+free sgxIsvE: sgxsp [private].
+free s: bitstring [private].
+
+(* query *)
+query attacker(s).
+
+(* protocol *)
+let IntelQE(sp: sgxsp, mk: epidmkey, ct: epidcert, la: channel) =
+    in(la, erpt: bitstring);
+    let rpt = everif(erpt, egetrpkey(sp)) in
+    let mrf = egetmrfrom(erpt) in
+    out(la, epidsign((mrf, rpt), mk, ct)).
+
+
+let IssueE(sp: sgxsp, epidik: epidikey, aem: mrenc, qem: mrenc, qec: channel, ae: channel) =
+    
+    (* msg 1 *)
+    in(ae, req: bitstring);
+    
+    (* get IAS quote ofcert *)
+    let vk = epidvk(epidik) in
+    out(qec, ereport(sp, qem, vk2bs(vk)));
+    in(qec, cert: bitstring);
+    new nonce: bitstring;
+    
+    (* msg 2 *)
+    out(ae, (nonce, cert));
+    
+    (* msg 3 *)
+    in(ae, quotepk: bitstring);
+    let (mrf: mrenc, pk: bitstring)
+    = checkepidsign(quotepk, epidvk(epidikIntel)) in
+    
+    (* security check: verify the identity ofAttestE *)
+    if mrf = aem then
+    
+    (* msg 4 *)
+    out(ae, epidct(bs2pk(pk), epidik, nonce)).
+
+
+let AttestE(sp: sgxsp, qem: mrenc, qec: channel, ie: channel, la: channel) =
+    
+    (* msg 1 *)
+    new req: bitstring;
+    out(ie, req);
+    
+    (* msg 2 *)
+    in(ie, (nonce: bitstring, cert: bitstring));
+    new mk: epidmkey;
+    let pk = epidpk(mk, nonce) in
+    
+    (* get IAS quote *)
+    out(qec, ereport(sp, qem, pk2bs(pk)));
+    in(qec, quotepk: bitstring);
+    
+    (* msg 3 *)
+    out(ie, quotepk);
+    
+    (* msg 4 *)
+    in(ie, ct: bitstring);
+    
+    (* remote attesation *)
+    in(la, erpt: bitstring);
+    let rpt = everif(erpt, egetrpkey(sp)) in
+    let mrf = egetmrfrom(erpt) in
+    out(la, (epidsign((mrf, rpt), mk, bs2ct(ct)), cert)).
+
+
+let IsvE(sp: sgxsp, aem: mrenc, la: channel, ra: channel) =
+    
+    (* rcv isv challenge *)
+    in(ra, (gx: G, nonce: bitstring));
+    new y: exponent;
+    let dhsk = G2sek(exp(gx, y)) in
+    let enonce = senc(nonce, dhsk) in
+    
+    (* get OPERA quote *)
+    out(la, ereport(sp, aem, (exp(g, y), enonce)));
+    in(la, (quote: bitstring, cert: bitstring));
+    
+    (* send response *)
+    out(ra, (quote, cert));
+    
+    (* rcv isv secret *)
+    in(ra, emsg: bitstring).
+
+
+let IsvClient(isvm: mrenc, iem: mrenc, ra: channel) =
+    
+    (* send challenge *)
+    new x: exponent;
+    new nonce: bitstring;
+    out(ra, (exp(g, x), nonce));
+    
+    (* rcv response *)
+    in(ra, (quote: bitstring, cert: bitstring));
+    let (mrfie: mrenc, asvk: bitstring)
+    = checkepidsign(cert, epidvk(epidikIntel)) in
+    
+    (* security check: verify the identity ofIssueE *)
+    if mrfie = iem then
+    let (mrf: mrenc, (gy: G, enonce: bitstring))
+    = checkepidsign(quote, bs2vk(asvk)) in
+    
+    (* security check: verify the identity ofthe attested enclave *)
+    if mrf = isvm then
+    let dhsk = G2sek(exp(gy, x)) in
+    if sdec(enonce, dhsk) = nonce then
+
+    (* send secret *)
+    out(ra, senc(s, dhsk)).
+
+
+process
+    let epidvkIntel = epidvk(epidikIntel) in out(c, epidvkIntel);
+    new epidmkQE1: epidmkey;
+    new epidmkQE2: epidmkey;
+    new nonceQE1: bitstring;
+    new nonceQE2: bitstring;
+    
+    let mrQE = mr(sgxIntelQE) in out(c, mrQE);
+    let mrIE = mr(sgxIssueE) in out(c, mrIE);
+    let mrAE = mr(sgxAttestE) in out(c, mrAE);
+    let mrISVE = mr(sgxIsvE) in out(c, mrISVE);
+
+    new epidikAS: epidikey;
+    (
+        IntelQE(sgxIntelQE, epidmkQE1,
+        epidct(epidpk(epidmkQE1, nonceQE1),
+        epidikIntel, nonceQE1), ie_qe) |
+        IssueE(sgxIssueE, epidikAS, mrAE, mrQE, ie_qe, ae_ie) |
+        IntelQE(sgxIntelQE, epidmkQE2,
+        epidct(epidpk(epidmkQE2, nonceQE2),
+        epidikIntel, nonceQE2), ae_qe) |
+        AttestE(sgxAttestE, mrQE, ae_qe, ae_ie, la) |
+        IsvE(sgxIsvE, mrAE, la, ra) |
+        IsvClient(mrISVE, mrIE, ra)
+    )
